@@ -1,0 +1,1405 @@
+#!/usr/bin/env python3
+"""GUI PDF Signer — sign PDFs with Hypersecu HYP2003 USB token."""
+
+import io
+import os
+import sys
+import threading
+import tkinter as tk
+from tkinter import filedialog, messagebox, ttk
+from pathlib import Path
+
+from pdf2image import convert_from_path
+from PIL import Image, ImageTk
+from pypdf import PdfReader
+
+# Sibling module that overlays the company stamps onto a PDF before signing.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import dsc_stamp
+
+import dsc_pkcs11
+
+# PKCS#11 module is discovered per-platform (Linux .so / macOS .dylib) rather
+# than hardcoded. Resolution never fails at import time, so the GUI still opens
+# when the token driver is missing; the error surfaces when you actually sign.
+def _resolve_pkcs11():
+    global PKCS11_MODULE
+    if not PKCS11_MODULE:
+        PKCS11_MODULE = dsc_pkcs11.find_module()
+    return PKCS11_MODULE
+
+try:
+    PKCS11_MODULE = dsc_pkcs11.find_module()
+except RuntimeError:
+    PKCS11_MODULE = ""
+TOKEN_LABEL = "HYP2003"
+PREVIEW_DPI = 150
+PDF_POINTS_PER_INCH = 72
+CANVAS_MAX_WIDTH = 700
+CANVAS_MAX_HEIGHT = 850
+
+# Default signature box size in PDF points
+DEFAULT_SIG_W_PT = 300
+DEFAULT_SIG_H_PT = 80
+
+
+class DraggableBox:
+    """A draggable/resizable rectangle on a Tkinter Canvas.
+
+    Optionally aspect-locked (resize preserves width/height ratio) and
+    showing a faded preview of a stamp image so placement is visible.
+    """
+
+    EDGE_THRESHOLD = 12  # pixels from an edge that still counts as "resize"
+    GRIP = 16            # size of the visible corner resize handle
+    MIN_W = 40           # smallest box width  (px)
+    MIN_H = 20           # smallest box height (px)
+
+    def __init__(self, canvas, x, y, w, h, on_move=None,
+                 aspect=None, label_text="Signature", color="#d32f2f",
+                 pil_image=None):
+        self.canvas = canvas
+        self.on_move = on_move
+        self.aspect = aspect            # width / height, or None = free resize
+        self.color = color
+        self.x, self.y, self.w, self.h = x, y, w, h
+        self._src_image = pil_image     # full-res PIL image for the preview
+        self._photo = None              # keeps the ImageTk ref alive
+        self.image = None               # canvas image item id
+
+        if self._src_image is not None:
+            self.image = canvas.create_image(x, y, anchor=tk.NW)
+        self.rect = canvas.create_rectangle(
+            x, y, x + w, y + h,
+            outline=color, width=2, dash=(6, 3),
+        )
+        self.label = None
+        if label_text:
+            self.label = canvas.create_text(
+                x + w / 2, y + 9,
+                text=label_text, fill=color, font=("Sans", 9, "bold"),
+            )
+        # Visible bottom-right resize handle — a big, obvious drag target.
+        g = self.GRIP
+        self.grip = canvas.create_rectangle(
+            x + w - g, y + h - g, x + w, y + h,
+            fill=color, outline="white", width=2,
+        )
+        self._drag_data = None
+
+        for item in (self.image, self.rect, self.label):
+            if item is None:
+                continue
+            canvas.tag_bind(item, "<ButtonPress-1>", self._on_press)
+            canvas.tag_bind(item, "<B1-Motion>", self._on_drag)
+            canvas.tag_bind(item, "<ButtonRelease-1>", self._on_release)
+            canvas.tag_bind(item, "<Motion>", self._on_hover)
+            canvas.tag_bind(item, "<Leave>", self._on_leave)
+        canvas.tag_bind(self.grip, "<ButtonPress-1>", self._on_grip_press)
+        canvas.tag_bind(self.grip, "<B1-Motion>", self._on_drag)
+        canvas.tag_bind(self.grip, "<ButtonRelease-1>", self._on_release)
+        canvas.tag_bind(self.grip, "<Enter>",
+                        lambda e: canvas.config(cursor="bottom_right_corner"))
+        canvas.tag_bind(self.grip, "<Leave>", self._on_leave)
+        self._render_image()
+
+    def _render_image(self):
+        """(Re)scale the preview image to the current box size, faded."""
+        if self._src_image is not None:
+            w, h = max(1, int(self.w)), max(1, int(self.h))
+            scaled = self._src_image.resize((w, h), Image.LANCZOS)
+            alpha = scaled.split()[-1].point(lambda a: int(a * 0.55))
+            scaled.putalpha(alpha)
+            self._photo = ImageTk.PhotoImage(scaled)
+            self.canvas.itemconfigure(self.image, image=self._photo)
+            self.canvas.tag_raise(self.rect, self.image)
+            if self.label is not None:
+                self.canvas.tag_raise(self.label, self.rect)
+        self.canvas.tag_raise(self.grip)  # handle stays on top, always grabbable
+
+    def _hit_edge(self, ex, ey):
+        t = self.EDGE_THRESHOLD
+        on_right = abs(ex - (self.x + self.w)) < t
+        on_bottom = abs(ey - (self.y + self.h)) < t
+        in_y = self.y - t <= ey <= self.y + self.h + t
+        in_x = self.x - t <= ex <= self.x + self.w + t
+        if on_right and on_bottom:
+            return "br"
+        if on_right and in_y:
+            return "r"
+        if on_bottom and in_x:
+            return "b"
+        return None
+
+    def _on_hover(self, event):
+        """Show a resize or move cursor depending on the pointer position."""
+        if self._drag_data:
+            return
+        cursors = {"br": "bottom_right_corner", "r": "sb_h_double_arrow",
+                   "b": "sb_v_double_arrow"}
+        self.canvas.config(
+            cursor=cursors.get(self._hit_edge(event.x, event.y), "fleur"))
+
+    def _on_leave(self, _event):
+        if not self._drag_data:
+            self.canvas.config(cursor="crosshair")
+
+    def _on_press(self, event):
+        self._begin_drag(event, self._hit_edge(event.x, event.y))
+
+    def _on_grip_press(self, event):
+        self._begin_drag(event, "br")
+
+    def _begin_drag(self, event, edge):
+        self._drag_data = {
+            "sx": event.x, "sy": event.y,
+            "ox": self.x, "oy": self.y,
+            "ow": self.w, "oh": self.h,
+            "edge": edge,
+        }
+
+    def _on_drag(self, event):
+        if not self._drag_data:
+            return
+        d = self._drag_data
+        dx = event.x - d["sx"]
+        dy = event.y - d["sy"]
+        edge = d["edge"]
+        if edge is None:
+            # Move
+            self.x = d["ox"] + dx
+            self.y = d["oy"] + dy
+        else:
+            if "r" in edge:
+                self.w = max(self.MIN_W, d["ow"] + dx)
+            if "b" in edge:
+                self.h = max(self.MIN_H, d["oh"] + dy)
+            if self.aspect:
+                # Aspect-lock: derive the other dimension.
+                if "r" in edge:
+                    self.h = self.w / self.aspect
+                else:
+                    self.w = self.h * self.aspect
+        self._update(rescale=False)
+
+    def _on_release(self, _event):
+        self._drag_data = None
+        self._render_image()
+
+    def _update(self, rescale=True):
+        self.canvas.coords(self.rect, self.x, self.y,
+                           self.x + self.w, self.y + self.h)
+        if self.label is not None:
+            self.canvas.coords(self.label, self.x + self.w / 2, self.y + 9)
+        g = self.GRIP
+        self.canvas.coords(self.grip,
+                           self.x + self.w - g, self.y + self.h - g,
+                           self.x + self.w, self.y + self.h)
+        if self.image is not None:
+            self.canvas.coords(self.image, self.x, self.y)
+            if rescale:
+                self._render_image()
+        self.canvas.tag_raise(self.grip)
+        if self.on_move:
+            self.on_move()
+
+    def reposition(self, x, y, w, h):
+        self.x, self.y, self.w, self.h = x, y, w, h
+        self._update(rescale=True)
+
+
+def run_gs_compress(inp, out, settings_or_resolution):
+    import subprocess
+    if isinstance(settings_or_resolution, str):
+        cmd = [
+            "gs", "-sDEVICE=pdfwrite", "-dCompatibilityLevel=1.4",
+            f"-dPDFSETTINGS={settings_or_resolution}", "-dNOPAUSE", "-dQUIET",
+            "-dBATCH", f"-sOutputFile={out}", str(inp)
+        ]
+    else:
+        res = settings_or_resolution
+        cmd = [
+            "gs", "-sDEVICE=pdfwrite", "-dCompatibilityLevel=1.4",
+            "-dNOPAUSE", "-dQUIET", "-dBATCH",
+            "-dColorImageDownsampleType=/Bicubic", f"-dColorImageResolution={res}",
+            "-dGrayImageDownsampleType=/Bicubic", f"-dGrayImageResolution={res}",
+            "-dMonoImageDownsampleType=/Bicubic", f"-dMonoImageResolution={res}",
+            f"-sOutputFile={out}", str(inp)
+        ]
+    res = subprocess.run(cmd, capture_output=True, text=True)
+    return res.returncode == 0
+
+
+def compress_to_target_size(inp, out, target_kb):
+    import tempfile
+    import shutil
+    from pathlib import Path
+    
+    attempts = ["/printer", "/ebook", "/screen", 50, 30]
+    best_temp = None
+    best_size = None
+    
+    for setting in attempts:
+        fd, temp_path = tempfile.mkstemp(suffix=".pdf")
+        os.close(fd)
+        t_path = Path(temp_path)
+        
+        try:
+            success = run_gs_compress(inp, t_path, setting)
+            if success and t_path.exists():
+                size_kb = t_path.stat().st_size / 1024.0
+                if size_kb <= target_kb:
+                    shutil.copy(str(t_path), str(out))
+                    t_path.unlink()
+                    if best_temp and best_temp.exists():
+                        best_temp.unlink()
+                    return True
+                
+                if best_size is None or size_kb < best_size:
+                    if best_temp and best_temp.exists():
+                        best_temp.unlink()
+                    best_temp = t_path
+                    best_size = size_kb
+                else:
+                    t_path.unlink()
+        except Exception:
+            if t_path.exists():
+                t_path.unlink()
+                
+    if best_temp and best_temp.exists():
+        shutil.copy(str(best_temp), str(out))
+        best_temp.unlink()
+        return True
+    return False
+
+
+class PDFSignerApp(tk.Tk):
+    def _get_optimized_signature_image(self, img_path):
+        """Optimizes a signature image to prevent PDF bloat.
+        Resizes large images to max 800px width/height and saves to a temp PNG.
+        Returns Path of optimized image (caller should cleanup), or original path.
+        """
+        import tempfile
+        from PIL import Image
+        
+        path_obj = Path(img_path)
+        if not path_obj.exists():
+            return path_obj
+            
+        try:
+            if path_obj.stat().st_size < 100 * 1024:
+                return path_obj
+                
+            with Image.open(path_obj) as im:
+                max_dim = 800
+                w, h = im.size
+                if w > max_dim or h > max_dim:
+                    if w > h:
+                        new_w = max_dim
+                        new_h = int(h * (max_dim / w))
+                    else:
+                        new_h = max_dim
+                        new_w = int(w * (max_dim / h))
+                    try:
+                        resample_filter = Image.Resampling.LANCZOS
+                    except AttributeError:
+                        resample_filter = Image.LANCZOS
+                    im = im.resize((new_w, new_h), resample_filter)
+                
+                fd, temp_file_path = tempfile.mkstemp(suffix=".png")
+                os.close(fd)
+                temp_path = Path(temp_file_path)
+                im.save(temp_path, "PNG", optimize=True)
+                return temp_path
+        except Exception as e:
+            print(f"Warning during signature image optimization: {e}")
+            return path_obj
+
+    def __init__(self, initial_files=None):
+        super().__init__()
+        self.title("DSC Sign — PDF Signer")
+        
+        # Load saved geometry
+        self.config_dir = Path.home() / ".config" / "dsc-sign"
+        self.config_file = self.config_dir / "gui-config.json"
+        saved_geometry = None
+        self._saved_same_pos = False
+        if self.config_file.exists():
+            try:
+                import json
+                with open(self.config_file, "r") as f:
+                    config = json.load(f)
+                    saved_geometry = config.get("geometry")
+                    self._saved_same_pos = bool(config.get("same_pos", False))
+            except Exception:
+                pass
+        
+        if saved_geometry:
+            self.geometry(saved_geometry)
+        else:
+            self.geometry("1050x750")
+            
+        self.minsize(900, 600)
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+        self.pdf_path = None
+        self.page_images = []       # PIL images at PREVIEW_DPI
+        self.page_photos = []       # scaled ImageTk for display
+        self.pdf_page_sizes = []    # (width_pt, height_pt) per page
+        self.current_page = 0
+        self.num_pages = 0
+        self.scale_factor = 1.0     # canvas pixels per PDF point
+        self.sig_box = None         # DraggableBox (signature / signatory block)
+        self.sig_box2 = None        # DraggableBox (optional 2nd signature, same page)
+        self.round_box = None       # DraggableBox (round company seal)
+        self.current_doc_idx = 0
+
+        # Signature box position in PDF points (defaults per page)
+        self.page_sig_positions = {} # {(doc_idx, page_num): (x_pt, y_pt, w_pt, h_pt)}
+        # Second-signature box position in PDF points (per page)
+        self.page_sig2_positions = {}
+        # Round-seal box position in PDF points (defaults per page)
+        self.page_round_positions = {}
+        # Cache of loaded stamp PIL images, keyed by file path
+        self._stamp_pil_cache = {}
+
+        # Current active coordinates
+        self.sig_x_pt = 50.0
+        self.sig_y_pt = 50.0
+        self.sig_w_pt = DEFAULT_SIG_W_PT
+        self.sig_h_pt = DEFAULT_SIG_H_PT
+
+        self._build_ui()
+
+        if initial_files:
+            self.pdf_paths = [Path(p) for p in initial_files if Path(p).exists()]
+            if self.pdf_paths:
+                self.current_doc_idx = 0
+                self.after(100, self._load_current_document)
+
+    # ── UI Construction ──────────────────────────────────────────────
+
+    def _build_ui(self):
+        # Top toolbar
+        toolbar = ttk.Frame(self, padding=4)
+        toolbar.pack(fill=tk.X)
+
+        ttk.Button(toolbar, text="Open PDF", command=self._open_pdf).pack(side=tk.LEFT, padx=4)
+        ttk.Separator(toolbar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=6)
+
+        ttk.Label(toolbar, text="PIN:").pack(side=tk.LEFT)
+        self.pin_var = tk.StringVar()
+        pin_entry = ttk.Entry(toolbar, textvariable=self.pin_var, show="*", width=12)
+        pin_entry.pack(side=tk.LEFT, padx=4)
+
+        self.sign_btn = ttk.Button(toolbar, text="Sign!", command=self._do_sign)
+        self.sign_btn.pack(side=tk.LEFT, padx=8)
+
+        self.process_btn = ttk.Button(toolbar, text="Process Only (No Sign)", command=self._do_process)
+        self.process_btn.pack(side=tk.LEFT, padx=4)
+
+        # Main area: canvas + right panel
+        main = ttk.PanedWindow(self, orient=tk.HORIZONTAL)
+        main.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
+
+        # Left: Canvas + page nav
+        left = ttk.Frame(main)
+        main.add(left, weight=3)
+
+        self.canvas = tk.Canvas(left, bg="#e0e0e0", cursor="crosshair")
+        self.canvas.pack(fill=tk.BOTH, expand=True)
+
+        nav = ttk.Frame(left, padding=4)
+        nav.pack(fill=tk.X)
+        self.prev_btn = ttk.Button(nav, text="< Prev Page", command=self._prev_page)
+        self.prev_btn.pack(side=tk.LEFT)
+        self.page_label = ttk.Label(nav, text="No PDF loaded", anchor=tk.CENTER)
+        self.page_label.pack(side=tk.LEFT, expand=True)
+        self.next_btn = ttk.Button(nav, text="Next Page >", command=self._next_page)
+        self.next_btn.pack(side=tk.RIGHT)
+
+        doc_nav = ttk.Frame(left, padding=4)
+        doc_nav.pack(fill=tk.X)
+        self.prev_doc_btn = ttk.Button(doc_nav, text="<< Prev Doc", command=self._prev_doc)
+        self.prev_doc_btn.pack(side=tk.LEFT)
+        self.doc_label = ttk.Label(doc_nav, text="", anchor=tk.CENTER)
+        self.doc_label.pack(side=tk.LEFT, expand=True)
+        self.next_doc_btn = ttk.Button(doc_nav, text="Next Doc >>", command=self._next_doc)
+        self.next_doc_btn.pack(side=tk.RIGHT)
+
+        # Right panel
+        right = ttk.Frame(main, padding=8)
+        main.add(right, weight=1)
+
+        # Sign mode
+        ttk.Label(right, text="Page Selection", font=("Sans", 11, "bold")).pack(anchor=tk.W, pady=(0, 6))
+        self.mode_var = tk.StringVar(value="last")
+        for val, txt in [("last", "Last page only"), ("all", "All pages"), ("choose", "Choose pages:")]:
+            ttk.Radiobutton(right, text=txt, variable=self.mode_var,
+                            value=val, command=self._mode_changed).pack(anchor=tk.W)
+
+        # Page checkboxes frame (scrollable)
+        self.pages_frame = ttk.Frame(right)
+        self.pages_frame.pack(fill=tk.BOTH, expand=True, pady=(4, 8))
+
+        self.page_checks = []  # list of BooleanVar
+
+        # One set of box positions for every page (and every open document)
+        self.same_pos_var = tk.BooleanVar(value=self._saved_same_pos)
+        ttk.Checkbutton(right, text="Same position on all pages",
+                        variable=self.same_pos_var,
+                        command=self._same_pos_changed).pack(anchor=tk.W, pady=(0, 4))
+
+        ttk.Separator(right, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=6)
+
+        # Pre-Processing
+        ttk.Label(right, text="Pre-Processing", font=("Sans", 11, "bold")).pack(anchor=tk.W, pady=(0, 4))
+        self.compress_var = tk.BooleanVar(value=False)
+        self.compress_chk = ttk.Checkbutton(right, text="Compress PDF", variable=self.compress_var, command=self._compress_changed)
+        self.compress_chk.pack(anchor=tk.W)
+
+        # Sub-frame for compression details
+        self.compress_details_frame = ttk.Frame(right, padding=(15, 0, 0, 0))
+        
+        ttk.Label(self.compress_details_frame, text="Compression Quality:").pack(anchor=tk.W, pady=(2, 0))
+        self.compress_mode_var = tk.StringVar(value="medium")
+        self.low_comp_btn = ttk.Radiobutton(self.compress_details_frame, text="Low (Best Quality)", variable=self.compress_mode_var, value="low")
+        self.low_comp_btn.pack(anchor=tk.W)
+        self.medium_comp_btn = ttk.Radiobutton(self.compress_details_frame, text="Medium", variable=self.compress_mode_var, value="medium")
+        self.medium_comp_btn.pack(anchor=tk.W)
+        self.high_comp_btn = ttk.Radiobutton(self.compress_details_frame, text="High (Smallest)", variable=self.compress_mode_var, value="high")
+        self.high_comp_btn.pack(anchor=tk.W)
+
+        self.target_size_enabled_var = tk.BooleanVar(value=False)
+        self.target_size_chk = ttk.Checkbutton(self.compress_details_frame, text="Target Size (KB):", variable=self.target_size_enabled_var, command=self._target_size_changed)
+        self.target_size_chk.pack(anchor=tk.W, pady=(4, 0))
+
+        self.target_size_var = tk.StringVar(value="500")
+        self.target_size_entry = ttk.Entry(self.compress_details_frame, textvariable=self.target_size_var, width=8)
+        self.target_size_entry.pack(anchor=tk.W, padx=20, pady=(0, 4))
+
+        self.ocr_var = tk.BooleanVar(value=False)
+        self.ocr_chk = ttk.Checkbutton(right, text="Run OCR", variable=self.ocr_var)
+        self.ocr_chk.pack(anchor=tk.W, pady=(4, 0))
+
+        ttk.Separator(right, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=6)
+        
+        # Appearance
+        ttk.Label(right, text="Appearance", font=("Sans", 11, "bold")).pack(anchor=tk.W, pady=(0, 4))
+        self.appearance_var = tk.StringVar(value="text")
+        ttk.Radiobutton(right, text="Text Stamp (Adobe Style)", variable=self.appearance_var, value="text").pack(anchor=tk.W)
+        ttk.Radiobutton(right, text="Image Stamp", variable=self.appearance_var, value="image").pack(anchor=tk.W)
+
+        # Optional second DSC signature placed elsewhere on the same page(s).
+        self.second_sig_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(right, text="Second signature (same page)",
+                        variable=self.second_sig_var,
+                        command=self._stamps_changed).pack(anchor=tk.W, pady=(6, 0))
+
+        ttk.Separator(right, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=6)
+
+        # Company stamps — overlaid on the page before signing
+        ttk.Label(right, text="Company Stamps", font=("Sans", 11, "bold")).pack(anchor=tk.W, pady=(0, 4))
+
+        self.signatory_stamp_var = tk.BooleanVar(value=False)
+        self.signatory_img_path = tk.StringVar(value=dsc_stamp.SIGNATORY_STAMP)
+        ttk.Checkbutton(right, text="Signatory block (DSC fills the gap)",
+                        variable=self.signatory_stamp_var,
+                        command=self._stamps_changed).pack(anchor=tk.W)
+        sig_row = ttk.Frame(right)
+        sig_row.pack(fill=tk.X, padx=(20, 0))
+        self.signatory_img_label = ttk.Label(
+            sig_row, text=os.path.basename(self.signatory_img_path.get()),
+            foreground="#666")
+        self.signatory_img_label.pack(side=tk.LEFT)
+        ttk.Button(sig_row, text="…", width=3,
+                   command=lambda: self._browse_stamp("signatory")).pack(side=tk.RIGHT)
+
+        self.round_stamp_var = tk.BooleanVar(value=False)
+        self.round_img_path = tk.StringVar(value=dsc_stamp.ROUND_STAMP)
+        ttk.Checkbutton(right, text="Company seal (round)",
+                        variable=self.round_stamp_var,
+                        command=self._stamps_changed).pack(anchor=tk.W, pady=(6, 0))
+        rnd_row = ttk.Frame(right)
+        rnd_row.pack(fill=tk.X, padx=(20, 0))
+        self.round_img_label = ttk.Label(
+            rnd_row, text=os.path.basename(self.round_img_path.get()),
+            foreground="#666")
+        self.round_img_label.pack(side=tk.LEFT)
+        ttk.Button(rnd_row, text="…", width=3,
+                   command=lambda: self._browse_stamp("round")).pack(side=tk.RIGHT)
+
+        ttk.Separator(right, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=6)
+
+        # Position readout
+        ttk.Label(right, text="Signature Position (PDF pts)",
+                  font=("Sans", 11, "bold")).pack(anchor=tk.W, pady=(0, 4))
+        self.pos_frame = ttk.Frame(right)
+        self.pos_frame.pack(fill=tk.X)
+
+        self.pos_labels = {}
+        for i, (key, label) in enumerate([("x", "x:"), ("y", "y:"), ("w", "w:"), ("h", "h:")]):
+            ttk.Label(self.pos_frame, text=label).grid(row=i // 2, column=(i % 2) * 2, padx=2, sticky=tk.E)
+            lbl = ttk.Label(self.pos_frame, text="—", width=8)
+            lbl.grid(row=i // 2, column=(i % 2) * 2 + 1, padx=(0, 10), sticky=tk.W)
+            self.pos_labels[key] = lbl
+
+        # Status bar
+        self.status_var = tk.StringVar(value="Ready — open a PDF to begin.")
+        status_bar = ttk.Label(self, textvariable=self.status_var, relief=tk.SUNKEN, padding=4)
+        status_bar.pack(fill=tk.X, side=tk.BOTTOM)
+
+    # ── PDF Loading ──────────────────────────────────────────────────
+
+    def _open_pdf(self):
+        import subprocess
+        try:
+            result = subprocess.run(
+                [
+                    "zenity", "--file-selection", "--multiple", "--separator=|",
+                    "--title=Open PDF(s)", 
+                    "--file-filter=PDF files | *.pdf *.PDF", 
+                    "--file-filter=All files | *"
+                ],
+                capture_output=True, text=True
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                paths = result.stdout.strip().split('|')
+            else:
+                paths = []
+        except FileNotFoundError:
+            selected = filedialog.askopenfilenames(
+                title="Open PDF(s)",
+                filetypes=[("PDF files", "*.pdf"), ("All files", "*.*")],
+            )
+            paths = list(selected) if selected else []
+
+        if not paths:
+            return
+            
+        self.pdf_paths = [Path(p) for p in paths]
+        self.current_doc_idx = 0
+        # Fresh batch — drop positions from any previously opened documents.
+        self.page_sig_positions = {}
+        self.page_round_positions = {}
+        self._load_current_document()
+
+    def _load_current_document(self):
+        self.pdf_path = self.pdf_paths[self.current_doc_idx]
+        
+        doc_msg = f"Doc {self.current_doc_idx + 1} of {len(self.pdf_paths)}"
+        self.doc_label.config(text=doc_msg)
+        
+        self.status_var.set(f"Loading {self.pdf_path.name}...")
+        self.update_idletasks()
+
+        try:
+            # Get page dimensions from PyPDF
+            reader = PdfReader(str(self.pdf_path))
+            self.num_pages = len(reader.pages)
+            self.pdf_page_sizes = []
+            
+            if not getattr(self, 'page_sig_positions', None):
+                self.page_sig_positions = {}
+                
+            for i, page in enumerate(reader.pages):
+                box = page.mediabox
+                w = float(box.width)
+                h = float(box.height)
+                self.pdf_page_sizes.append((w, h))
+                key = (self.current_doc_idx, i)
+                if key not in self.page_sig_positions:
+                    self.page_sig_positions[key] = (50.0, 50.0, DEFAULT_SIG_W_PT, DEFAULT_SIG_H_PT)
+
+            # Render pages with pdf2image
+            self.page_images = convert_from_path(
+                str(self.pdf_path), dpi=PREVIEW_DPI,
+            )
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to load PDF:\n{e}")
+            self.status_var.set("Error loading PDF.")
+            return
+
+        self.current_page = 0
+        self._build_page_checks()
+        self._show_page()
+        self.status_var.set(f"Loaded {self.pdf_path.name} — {self.num_pages} page(s)")
+
+    def _prev_doc(self):
+        if hasattr(self, 'pdf_paths') and self.current_doc_idx > 0:
+            self.current_doc_idx -= 1
+            self._load_current_document()
+
+    def _next_doc(self):
+        if hasattr(self, 'pdf_paths') and self.current_doc_idx < len(self.pdf_paths) - 1:
+            self.current_doc_idx += 1
+            self._load_current_document()
+
+    def _build_page_checks(self):
+        for w in self.pages_frame.winfo_children():
+            w.destroy()
+        self.page_checks = []
+
+        # Scrollable if many pages
+        canvas = tk.Canvas(self.pages_frame, highlightthickness=0)
+        scrollbar = ttk.Scrollbar(self.pages_frame, orient=tk.VERTICAL, command=canvas.yview)
+        inner = ttk.Frame(canvas)
+
+        inner.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.create_window((0, 0), window=inner, anchor=tk.NW)
+        canvas.configure(yscrollcommand=scrollbar.set)
+
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        for i in range(self.num_pages):
+            var = tk.BooleanVar(value=(i == self.num_pages - 1))
+            cb = ttk.Checkbutton(inner, text=f"Page {i + 1}", variable=var)
+            cb.pack(anchor=tk.W)
+            self.page_checks.append(var)
+
+        self._mode_changed()
+
+    def _mode_changed(self):
+        mode = self.mode_var.get()
+        state = tk.NORMAL if mode == "choose" else tk.DISABLED
+        for w in self.pages_frame.winfo_children():
+            # Reach into the inner frame
+            inner_canvas = w
+            if isinstance(w, tk.Canvas):
+                for child_id in w.find_all():
+                    pass
+        # Enable/disable checkbuttons via inner frame
+        self._set_checks_state(self.pages_frame, state)
+
+    def _set_checks_state(self, widget, state):
+        for child in widget.winfo_children():
+            if isinstance(child, ttk.Checkbutton):
+                child.configure(state=state)
+            elif isinstance(child, (ttk.Frame, tk.Frame)):
+                self._set_checks_state(child, state)
+            elif isinstance(child, tk.Canvas):
+                # The inner frame is embedded in the canvas
+                for sub in child.winfo_children():
+                    self._set_checks_state(sub, state)
+
+    def _compress_changed(self):
+        if self.compress_var.get():
+            self.compress_details_frame.pack(anchor=tk.W, fill=tk.X)
+            self._target_size_changed()
+        else:
+            self.compress_details_frame.pack_forget()
+
+    def _target_size_changed(self):
+        target_enabled = self.target_size_enabled_var.get()
+        if target_enabled:
+            self.low_comp_btn.configure(state=tk.DISABLED)
+            self.medium_comp_btn.configure(state=tk.DISABLED)
+            self.high_comp_btn.configure(state=tk.DISABLED)
+            self.target_size_entry.configure(state=tk.NORMAL)
+        else:
+            self.low_comp_btn.configure(state=tk.NORMAL)
+            self.medium_comp_btn.configure(state=tk.NORMAL)
+            self.high_comp_btn.configure(state=tk.NORMAL)
+            self.target_size_entry.configure(state=tk.DISABLED)
+
+    # ── Page Display ─────────────────────────────────────────────────
+
+    def _show_page(self):
+        if not self.page_images:
+            return
+
+        img = self.page_images[self.current_page]
+        page_w_pt, page_h_pt = self.pdf_page_sizes[self.current_page]
+
+        # Scale image to fit canvas
+        self.update_idletasks()
+        cw = max(self.canvas.winfo_width(), 400)
+        ch = max(self.canvas.winfo_height(), 400)
+
+        # Compute scale: canvas pixels per PDF point
+        scale_x = cw / page_w_pt
+        scale_y = ch / page_h_pt
+        self.scale_factor = min(scale_x, scale_y) * 0.95  # slight margin
+
+        display_w = int(page_w_pt * self.scale_factor)
+        display_h = int(page_h_pt * self.scale_factor)
+
+        resized = img.resize((display_w, display_h), Image.LANCZOS)
+        photo = ImageTk.PhotoImage(resized)
+        self._current_photo = photo  # prevent GC
+
+        self.canvas.delete("all")
+        # Center image on canvas
+        self._img_offset_x = (cw - display_w) // 2
+        self._img_offset_y = (ch - display_h) // 2
+        self.canvas.create_image(self._img_offset_x, self._img_offset_y,
+                                 anchor=tk.NW, image=photo)
+
+        # Restore page-specific coordinates (scoped per document)
+        pos_key = (self.current_doc_idx, self.current_page)
+        if pos_key in self.page_sig_positions:
+            self.sig_x_pt, self.sig_y_pt, self.sig_w_pt, self.sig_h_pt = self.page_sig_positions[pos_key]
+
+        signatory_on = self.signatory_stamp_var.get()
+        round_on = self.round_stamp_var.get()
+
+        # When the signatory block is enabled, the signature box *is* the
+        # signatory stamp: lock it to the stamp's aspect ratio so the
+        # auto-placed DSC field lands inside the "(Signature)" gap.
+        if signatory_on:
+            self.sig_h_pt = self.sig_w_pt / dsc_stamp.SIGNATORY_ASPECT
+            self.page_sig_positions[pos_key] = (
+                self.sig_x_pt, self.sig_y_pt, self.sig_w_pt, self.sig_h_pt)
+
+        # Draw signature / signatory box at stored PDF-point position
+        bx = self._img_offset_x + self.sig_x_pt * self.scale_factor
+        by = self._img_offset_y + self.sig_y_pt * self.scale_factor
+        bw = self.sig_w_pt * self.scale_factor
+        bh = self.sig_h_pt * self.scale_factor
+
+        self.sig_box = DraggableBox(
+            self.canvas, bx, by, bw, bh,
+            on_move=self._on_box_moved,
+            aspect=dsc_stamp.SIGNATORY_ASPECT if signatory_on else None,
+            label_text=None if signatory_on else "Signature",
+            pil_image=self._load_stamp_pil(self.signatory_img_path.get())
+            if signatory_on else None,
+        )
+        self._update_pos_display()
+
+        # Draw the optional second signature box (green), if enabled
+        self.sig_box2 = None
+        if getattr(self, "second_sig_var", None) and self.second_sig_var.get():
+            s2x, s2y, s2w, s2h = self.page_sig2_positions.get(
+                pos_key, (max(50.0, page_w_pt - 350.0), self.sig_y_pt, 300.0, 80.0))
+            self.sig_box2 = DraggableBox(
+                self.canvas,
+                self._img_offset_x + s2x * self.scale_factor,
+                self._img_offset_y + s2y * self.scale_factor,
+                s2w * self.scale_factor,
+                s2h * self.scale_factor,
+                on_move=self._on_box2_moved,
+                aspect=None,
+                label_text="Signature 2",
+                color="#2e7d32",
+            )
+            self.page_sig2_positions[pos_key] = (s2x, s2y, s2w, s2h)
+            self._on_box2_moved()
+
+        # Draw the round company seal box, if enabled
+        self.round_box = None
+        if round_on:
+            rx_pt, ry_pt, rw_pt, rh_pt = self.page_round_positions.get(
+                pos_key, (page_w_pt - 170.0, page_h_pt - 190.0, 130.0, 130.0))
+            self.round_box = DraggableBox(
+                self.canvas,
+                self._img_offset_x + rx_pt * self.scale_factor,
+                self._img_offset_y + ry_pt * self.scale_factor,
+                rw_pt * self.scale_factor,
+                rh_pt * self.scale_factor,
+                on_move=self._on_round_box_moved,
+                aspect=dsc_stamp.ROUND_ASPECT,
+                label_text=None,
+                color="#1565c0",
+                pil_image=self._load_stamp_pil(self.round_img_path.get()),
+            )
+            self._on_round_box_moved()
+
+        if self.same_pos_var.get():
+            self._propagate_positions()
+
+        # Page label
+        self.page_label.config(text=f"Page {self.current_page + 1} / {self.num_pages}")
+
+    def _on_box_moved(self):
+        """Update stored PDF-point coords from canvas box position."""
+        box = self.sig_box
+        self.sig_x_pt = (box.x - self._img_offset_x) / self.scale_factor
+        self.sig_y_pt = (box.y - self._img_offset_y) / self.scale_factor
+        self.sig_w_pt = box.w / self.scale_factor
+        self.sig_h_pt = box.h / self.scale_factor
+        
+        # Save coordinates for the current page
+        self.page_sig_positions[(self.current_doc_idx, self.current_page)] = (self.sig_x_pt, self.sig_y_pt, self.sig_w_pt, self.sig_h_pt)
+        if self.same_pos_var.get():
+            self._propagate_positions()
+
+        self._update_pos_display()
+
+    def _on_round_box_moved(self):
+        """Persist the round-seal box position for the current page."""
+        box = self.round_box
+        if box is None:
+            return
+        x = (box.x - self._img_offset_x) / self.scale_factor
+        y = (box.y - self._img_offset_y) / self.scale_factor
+        w = box.w / self.scale_factor
+        h = box.h / self.scale_factor
+        self.page_round_positions[(self.current_doc_idx, self.current_page)] = (x, y, w, h)
+        if self.same_pos_var.get():
+            self._propagate_positions()
+
+    def _on_box2_moved(self):
+        """Persist the second-signature box position for the current page."""
+        box = self.sig_box2
+        if box is None:
+            return
+        x = (box.x - self._img_offset_x) / self.scale_factor
+        y = (box.y - self._img_offset_y) / self.scale_factor
+        w = box.w / self.scale_factor
+        h = box.h / self.scale_factor
+        self.page_sig2_positions[(self.current_doc_idx, self.current_page)] = (x, y, w, h)
+        if self.same_pos_var.get():
+            self._propagate_positions()
+
+    def _propagate_positions(self):
+        """Copy the current page's box positions to every page of this document."""
+        if not self.page_images:
+            return
+        doc = self.current_doc_idx
+        cur = (doc, self.current_page)
+        sig = (self.sig_x_pt, self.sig_y_pt, self.sig_w_pt, self.sig_h_pt)
+        sig2 = self.page_sig2_positions.get(cur)
+        rnd = self.page_round_positions.get(cur)
+        for pg in range(self.num_pages):
+            self.page_sig_positions[(doc, pg)] = sig
+            if sig2 is not None:
+                self.page_sig2_positions[(doc, pg)] = sig2
+            if rnd is not None:
+                self.page_round_positions[(doc, pg)] = rnd
+
+    def _same_pos_reference(self):
+        """The on-screen positions, applied to every page of every document at sign time."""
+        cur = (self.current_doc_idx, self.current_page)
+        return {
+            "sig": (self.sig_x_pt, self.sig_y_pt, self.sig_w_pt, self.sig_h_pt),
+            "sig2": self.page_sig2_positions.get(cur),
+            "round": self.page_round_positions.get(cur),
+        }
+
+    def _same_pos_changed(self):
+        if self.same_pos_var.get() and self.page_images:
+            self._propagate_positions()
+            self._update_pos_display()
+
+    def _load_stamp_pil(self, path):
+        """Load (and cache) a stamp image as an RGBA PIL image, or None."""
+        if not path or not os.path.exists(path):
+            return None
+        if path not in self._stamp_pil_cache:
+            try:
+                self._stamp_pil_cache[path] = Image.open(path).convert("RGBA")
+            except Exception:
+                self._stamp_pil_cache[path] = None
+        return self._stamp_pil_cache[path]
+
+    def _stamps_changed(self):
+        """Redraw the current page when a stamp checkbox is toggled."""
+        if self.page_images:
+            self._show_page()
+
+    def _browse_stamp(self, which):
+        """Pick a different image file for the round or signatory stamp."""
+        path = filedialog.askopenfilename(
+            title=f"Select {which} stamp image",
+            filetypes=[("Images", "*.png *.jpg *.jpeg"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        # Copy the chosen stamp into the config folder so it persists across
+        # runs and survives the original being moved/deleted.
+        try:
+            path = dsc_stamp.save_stamp("round" if which == "round" else "signatory", path)
+        except Exception:
+            pass
+        self._stamp_pil_cache.pop(path, None)  # force reload of the new artwork
+        if which == "round":
+            self.round_img_path.set(path)
+            self.round_img_label.config(text=os.path.basename(path))
+        else:
+            self.signatory_img_path.set(path)
+            self.signatory_img_label.config(text=os.path.basename(path))
+        self._stamps_changed()
+
+    def _update_pos_display(self):
+        self.pos_labels["x"].config(text=f"{self.sig_x_pt:.0f}")
+        self.pos_labels["y"].config(text=f"{self.sig_y_pt:.0f}")
+        self.pos_labels["w"].config(text=f"{self.sig_w_pt:.0f}")
+        self.pos_labels["h"].config(text=f"{self.sig_h_pt:.0f}")
+
+    def _prev_page(self):
+        if self.current_page > 0:
+            self.current_page -= 1
+            self._show_page()
+
+    def _next_page(self):
+        if self.current_page < self.num_pages - 1:
+            self.current_page += 1
+            self._show_page()
+
+    # ── Signing ──────────────────────────────────────────────────────
+
+    def _get_chosen_pages(self):
+        """Return list of chosen page indices (only for 'choose' mode)."""
+        return [i for i, var in enumerate(self.page_checks) if var.get()]
+
+    def _do_sign(self):
+        if not hasattr(self, 'pdf_paths') or not self.pdf_paths:
+            messagebox.showwarning("No PDF", "Open a PDF first.")
+            return
+
+        pin = self.pin_var.get()
+        if not pin:
+            messagebox.showwarning("PIN required", "Enter your token PIN.")
+            return
+
+        mode = self.mode_var.get()
+        chosen_pages = []
+        if mode == "choose":
+            chosen_pages = self._get_chosen_pages()
+            if not chosen_pages:
+                messagebox.showwarning("No pages", "Select at least one page to sign.")
+                return
+
+        compress_opts = {
+            "enabled": self.compress_var.get(),
+            "mode": self.compress_mode_var.get(),
+            "target_enabled": self.target_size_enabled_var.get(),
+            "target_size": int(self.target_size_var.get()) if self.target_size_var.get().isdigit() else 500
+        }
+        do_ocr = self.ocr_var.get()
+        appearance_mode = self.appearance_var.get()
+
+        # Capture stamp settings on the main thread (tk vars / dicts).
+        stamp_opts = {
+            "round": self.round_stamp_var.get(),
+            "signatory": self.signatory_stamp_var.get(),
+            "round_img": self.round_img_path.get(),
+            "signatory_img": self.signatory_img_path.get(),
+            "round_pos": dict(self.page_round_positions),
+            "second_sig": self.second_sig_var.get(),
+            "sig2_pos": dict(self.page_sig2_positions),
+            "same_pos": self._same_pos_reference() if self.same_pos_var.get() else None,
+        }
+
+        self.sign_btn.configure(state=tk.DISABLED)
+        self.process_btn.configure(state=tk.DISABLED)
+        doc_count = len(self.pdf_paths)
+        self.status_var.set(f"Signing {doc_count} document(s)...")
+        self.update_idletasks()
+
+        # Run signing in a thread to keep UI responsive
+        thread = threading.Thread(target=self._sign_thread, args=(pin, mode, chosen_pages, compress_opts, do_ocr, appearance_mode, stamp_opts), daemon=True)
+        thread.start()
+
+    def _sign_thread(self, pin, mode, chosen_pages, compress_opts, do_ocr, appearance_mode, stamp_opts):
+        from pyhanko.sign.pkcs11 import PKCS11Signer, open_pkcs11_session, TokenCriteria
+        import pkcs11 as pk
+
+        success_count = 0
+        errors = []
+        session = None
+
+        try:
+            _resolve_pkcs11()
+
+            session = open_pkcs11_session(
+                lib_location=PKCS11_MODULE,
+                token_criteria=TokenCriteria(label=TOKEN_LABEL),
+                user_pin=pin,
+            )
+
+            # Find certificate label
+            cert_label = None
+            for obj in session.get_objects({pk.Attribute.CLASS: pk.ObjectClass.CERTIFICATE}):
+                cert_label = obj[pk.Attribute.LABEL]
+                break
+            if not cert_label:
+                raise RuntimeError("No certificates found on token")
+
+            signer_obj = PKCS11Signer(
+                pkcs11_session=session,
+                key_label=cert_label,
+                cert_label=cert_label,
+                use_raw_mechanism=True,
+            )
+
+            for doc_idx, path in enumerate(self.pdf_paths):
+                try:
+                    self._sign_single_pdf(doc_idx, path, signer_obj, mode, chosen_pages, compress_opts, do_ocr, appearance_mode, stamp_opts)
+                    success_count += 1
+                except Exception as e:
+                    errors.append(f"{path.name}: {repr(e)}")
+
+        except Exception as e:
+            errors.append(f"Token error: {repr(e)}")
+        finally:
+            if session:
+                try:
+                    session.close()
+                except Exception:
+                    pass
+
+        self.after(0, self._sign_done, success_count, len(self.pdf_paths), errors)
+
+    def _sign_done(self, success_count, total, errors):
+        self.sign_btn.configure(state=tk.NORMAL)
+        self.process_btn.configure(state=tk.NORMAL)
+        if errors:
+            err_msg = "\n".join(errors)
+            self.status_var.set(f"Signed {success_count}/{total} with errors.")
+            messagebox.showerror("Signing Issues", f"Some files failed:\n{err_msg}")
+        else:
+            self.status_var.set(f"Successfully signed {success_count} document(s).")
+            messagebox.showinfo("Success", f"Successfully signed {success_count} document(s).")
+
+    def _do_process(self):
+        if not hasattr(self, 'pdf_paths') or not self.pdf_paths:
+            messagebox.showwarning("No PDF", "Open a PDF first.")
+            return
+
+        mode = self.mode_var.get()
+        chosen_pages = []
+        if mode == "choose":
+            chosen_pages = self._get_chosen_pages()
+            do_stamp = self.round_stamp_var.get() or self.signatory_stamp_var.get()
+            if do_stamp and not chosen_pages:
+                messagebox.showwarning("No pages", "Select at least one page to apply stamps.")
+                return
+
+        compress_opts = {
+            "enabled": self.compress_var.get(),
+            "mode": self.compress_mode_var.get(),
+            "target_enabled": self.target_size_enabled_var.get(),
+            "target_size": int(self.target_size_var.get()) if self.target_size_var.get().isdigit() else 500
+        }
+        do_ocr = self.ocr_var.get()
+        
+        do_stamp = self.round_stamp_var.get() or self.signatory_stamp_var.get()
+        if not (compress_opts["enabled"] or do_ocr or do_stamp):
+            messagebox.showwarning("No action selected", "Select Compress, OCR, or at least one stamp to apply.")
+            return
+
+        # Capture stamp settings on the main thread (tk vars / dicts).
+        stamp_opts = {
+            "round": self.round_stamp_var.get(),
+            "signatory": self.signatory_stamp_var.get(),
+            "round_img": self.round_img_path.get(),
+            "signatory_img": self.signatory_img_path.get(),
+            "round_pos": dict(self.page_round_positions),
+            "second_sig": self.second_sig_var.get(),
+            "sig2_pos": dict(self.page_sig2_positions),
+            "same_pos": self._same_pos_reference() if self.same_pos_var.get() else None,
+        }
+
+        self.sign_btn.configure(state=tk.DISABLED)
+        self.process_btn.configure(state=tk.DISABLED)
+        doc_count = len(self.pdf_paths)
+        self.status_var.set(f"Processing {doc_count} document(s)...")
+        self.update_idletasks()
+
+        # Run processing in a thread to keep UI responsive
+        thread = threading.Thread(
+            target=self._process_thread,
+            args=(mode, chosen_pages, compress_opts, do_ocr, stamp_opts),
+            daemon=True
+        )
+        thread.start()
+
+    def _process_thread(self, mode, chosen_pages, compress_opts, do_ocr, stamp_opts):
+        success_count = 0
+        errors = []
+
+        for doc_idx, path in enumerate(self.pdf_paths):
+            try:
+                self._sign_single_pdf(
+                    doc_idx=doc_idx,
+                    input_path=path,
+                    signer_obj=None,
+                    mode=mode,
+                    chosen_pages=chosen_pages,
+                    compress_opts=compress_opts,
+                    do_ocr=do_ocr,
+                    appearance_mode=None,
+                    stamp_opts=stamp_opts
+                )
+                success_count += 1
+            except Exception as e:
+                errors.append(f"{path.name}: {repr(e)}")
+
+        self.after(0, self._process_done, success_count, len(self.pdf_paths), errors)
+
+    def _process_done(self, success_count, total, errors):
+        self.sign_btn.configure(state=tk.NORMAL)
+        self.process_btn.configure(state=tk.NORMAL)
+        if errors:
+            err_msg = "\n".join(errors)
+            self.status_var.set(f"Processed {success_count}/{total} with errors.")
+            messagebox.showerror("Processing Issues", f"Some files failed:\n{err_msg}")
+        else:
+            self.status_var.set(f"Successfully processed {success_count} document(s).")
+            messagebox.showinfo("Success", f"Successfully processed {success_count} document(s).")
+
+    def _sign_single_pdf(self, doc_idx, input_path, signer_obj, mode, chosen_pages, compress_opts, do_ocr, appearance_mode, stamp_opts):
+        import subprocess
+        import tempfile
+        from pyhanko.sign.signers.pdf_signer import PdfSigner
+        from pyhanko.stamp.static import StaticStampStyle
+        from pyhanko.stamp.text import TextStampStyle
+        from pyhanko.pdf_utils.images import PdfImage
+        from pyhanko.sign import signers
+        from pyhanko.sign.fields import SigFieldSpec
+        from pyhanko.pdf_utils.incremental_writer import IncrementalPdfFileWriter
+        from pypdf import PdfReader
+
+        if signer_obj is None:
+            output_path = input_path.with_stem(input_path.stem + "_processed")
+        else:
+            output_path = input_path.with_stem(input_path.stem + "_signed")
+        
+        current_input = input_path
+        temp_files = []
+        
+        if do_ocr:
+            fd, temp_file_path = tempfile.mkstemp(suffix=".pdf")
+            os.close(fd)
+            temp_file_ocr = Path(temp_file_path)
+            temp_files.append(temp_file_ocr)
+            
+            cmd = ["ocrmypdf", "--force-ocr", str(current_input), str(temp_file_ocr)]
+            res = subprocess.run(cmd, capture_output=True, text=True)
+            if res.returncode != 0:
+                for f in temp_files:
+                    if f.exists(): f.unlink()
+                raise RuntimeError(f"OCR failed: {res.stderr}")
+            current_input = temp_file_ocr
+
+        if compress_opts and compress_opts.get("enabled"):
+            fd, temp_file_path = tempfile.mkstemp(suffix=".pdf")
+            os.close(fd)
+            temp_file_compress = Path(temp_file_path)
+            temp_files.append(temp_file_compress)
+            
+            if compress_opts.get("target_enabled"):
+                target_kb = compress_opts.get("target_size", 500)
+                success = compress_to_target_size(current_input, temp_file_compress, target_kb)
+                if not success:
+                    for f in temp_files:
+                        if f.exists(): f.unlink()
+                    raise RuntimeError("Target size compression failed")
+            else:
+                comp_mode = compress_opts.get("mode", "medium")
+                gs_mode = "/ebook"
+                if comp_mode == "low":
+                    gs_mode = "/printer"
+                elif comp_mode == "high":
+                    gs_mode = "/screen"
+                
+                success = run_gs_compress(current_input, temp_file_compress, gs_mode)
+                if not success:
+                    for f in temp_files:
+                        if f.exists(): f.unlink()
+                    raise RuntimeError("Compression failed")
+            
+            current_input = temp_file_compress
+
+        reader = PdfReader(str(current_input))
+        num_pages = len(reader.pages)
+        page_sizes = [(float(p.mediabox.width), float(p.mediabox.height)) for p in reader.pages]
+
+        stamps_enabled = stamp_opts and (stamp_opts.get("round") or stamp_opts.get("signatory"))
+        same_pos = stamp_opts.get("same_pos") if stamp_opts else None  # one box for every page/document
+
+        if signer_obj is not None or stamps_enabled:
+            if mode == "last":
+                pages_to_sign = [num_pages - 1]
+            elif mode == "all":
+                pages_to_sign = list(range(num_pages))
+            else:
+                pages_to_sign = [p for p in chosen_pages if p < num_pages]
+
+            if not pages_to_sign:
+                for f in temp_files:
+                    if f.exists(): f.unlink()
+                return
+        else:
+            pages_to_sign = []
+
+        # ── Overlay company stamps onto the signed pages (before signing) ──
+        stamp_temp = None
+        if stamp_opts and (stamp_opts.get("round") or stamp_opts.get("signatory")):
+            placements = {}
+            for pg in pages_to_sign:
+                pg_w, pg_h = page_sizes[pg]
+                items = []
+                if stamp_opts.get("signatory"):
+                    if same_pos:
+                        sx, sy, sw, sh = same_pos["sig"]
+                    else:
+                        sx, sy, sw, sh = self.page_sig_positions.get(
+                            (doc_idx, pg),
+                            self.page_sig_positions.get((doc_idx, 0), (50.0, 50.0, 300.0, 80.0)))
+                    sh = sw / dsc_stamp.SIGNATORY_ASPECT  # keep undistorted
+                    items.append((stamp_opts["signatory_img"], sx, sy, sw, sh))
+                if stamp_opts.get("round"):
+                    if same_pos and same_pos.get("round"):
+                        rx, ry, rw, rh = same_pos["round"]
+                    else:
+                        rx, ry, rw, rh = stamp_opts.get("round_pos", {}).get(
+                            (doc_idx, pg), (pg_w - 170.0, pg_h - 190.0, 130.0, 130.0))
+                    items.append((stamp_opts["round_img"], rx, ry, rw, rh))
+                if items:
+                    placements[pg] = items
+            if placements:
+                fd, stamp_temp_path = tempfile.mkstemp(suffix=".pdf")
+                os.close(fd)
+                stamp_temp = Path(stamp_temp_path)
+                dsc_stamp.apply_stamps(str(current_input), str(stamp_temp), placements)
+                current_input = stamp_temp
+
+        if signer_obj is None:
+            import shutil
+            shutil.copy(str(current_input), str(output_path))
+            for f in temp_files:
+                if f.exists(): f.unlink()
+            if stamp_temp and stamp_temp.exists():
+                stamp_temp.unlink()
+            return
+
+        stamp_style = None
+        appearance_text_params = None
+        opt_sig_temp = None
+        if appearance_mode == "text":
+            from pyhanko.stamp import STAMP_ART_CONTENT
+            try:
+                signer_name = signer_obj.subject_name or "Unknown Signer"
+            except Exception:
+                signer_name = "Unknown Signer"
+                
+            stamp_style = TextStampStyle(
+                stamp_text="Digitally signed by %(signer)s.\nTimestamp: %(ts)s.",
+                background=STAMP_ART_CONTENT
+            )
+            appearance_text_params = {
+                'signer': signer_name
+            }
+        else:
+            stamp_path = dsc_stamp.SIGNATURE_IMAGE
+            if os.path.exists(stamp_path):
+                try:
+                    opt_sig_temp = self._get_optimized_signature_image(stamp_path)
+                    stamp_style = StaticStampStyle(background=PdfImage(str(opt_sig_temp)))
+                except Exception:
+                    pass
+
+        for page_num in pages_to_sign:
+            page_w_pt, page_h_pt = page_sizes[page_num]
+            
+            # Fetch coordinates for this page, or fallback
+            if same_pos:
+                sig_x, sig_y, sig_w, sig_h = same_pos["sig"]
+            elif (doc_idx, page_num) in self.page_sig_positions:
+                sig_x, sig_y, sig_w, sig_h = self.page_sig_positions[(doc_idx, page_num)]
+            else:
+                sig_x, sig_y, sig_w, sig_h = self.page_sig_positions.get(
+                    (doc_idx, 0), (50.0, 50.0, 150.0, 50.0))
+
+            # With the signatory block enabled, the DSC field is placed
+            # inside the stamp's blank "(Signature)" gap, not the whole box.
+            if stamp_opts and stamp_opts.get("signatory"):
+                sig_h = sig_w / dsc_stamp.SIGNATORY_ASPECT
+                sig_x, sig_y, sig_w, sig_h = dsc_stamp.gap_rect(
+                    (sig_x, sig_y, sig_w, sig_h))
+
+            x1 = max(0, sig_x)
+            y_bottom = page_h_pt - sig_y - sig_h
+            y1 = max(0, y_bottom)
+            x2 = x1 + sig_w
+            y2 = y1 + sig_h
+
+            field_name = f"DSC_Signature_{page_num + 1}"
+
+            with open(current_input, "rb") as inf:
+                writer = IncrementalPdfFileWriter(inf, strict=False)
+                sig_field = SigFieldSpec(
+                    sig_field_name=field_name,
+                    on_page=page_num,
+                    box=(x1, y1, x2, y2),
+                )
+                pdf_signer = PdfSigner(
+                    signers.PdfSignatureMetadata(field_name=field_name),
+                    signer_obj,
+                    new_field_spec=sig_field,
+                    stamp_style=stamp_style
+                )
+                if appearance_mode == "text" and appearance_text_params:
+                    out = pdf_signer.sign_pdf(writer, appearance_text_params=appearance_text_params)
+                else:
+                    out = pdf_signer.sign_pdf(writer)
+                
+            with open(output_path, "wb") as outf:
+                outf.write(out.getvalue())
+
+            current_input = output_path
+
+            # ── Optional second DSC signature on the same page ──
+            if stamp_opts and stamp_opts.get("second_sig"):
+                if same_pos and same_pos.get("sig2"):
+                    s2 = same_pos["sig2"]
+                else:
+                    s2 = stamp_opts.get("sig2_pos", {}).get(
+                        (doc_idx, page_num),
+                        stamp_opts.get("sig2_pos", {}).get(
+                            (doc_idx, 0),
+                            (max(50.0, page_w_pt - 350.0), 50.0, 300.0, 80.0)))
+                s2x, s2y, s2w, s2h = s2
+                bx1 = max(0, s2x)
+                by1 = max(0, page_h_pt - s2y - s2h)
+                field2 = f"DSC_Signature_{page_num + 1}_2"
+                with open(current_input, "rb") as inf2:
+                    writer2 = IncrementalPdfFileWriter(inf2, strict=False)
+                    sig_field2 = SigFieldSpec(
+                        sig_field_name=field2, on_page=page_num,
+                        box=(bx1, by1, bx1 + s2w, by1 + s2h))
+                    pdf_signer2 = PdfSigner(
+                        signers.PdfSignatureMetadata(field_name=field2),
+                        signer_obj, new_field_spec=sig_field2,
+                        stamp_style=stamp_style)
+                    if appearance_mode == "text" and appearance_text_params:
+                        out2 = pdf_signer2.sign_pdf(
+                            writer2, appearance_text_params=appearance_text_params)
+                    else:
+                        out2 = pdf_signer2.sign_pdf(writer2)
+                with open(output_path, "wb") as outf2:
+                    outf2.write(out2.getvalue())
+                current_input = output_path
+
+        for f in temp_files:
+            if f.exists(): f.unlink()
+        if stamp_temp and stamp_temp.exists():
+            stamp_temp.unlink()
+        if opt_sig_temp and opt_sig_temp != Path(stamp_path) and opt_sig_temp.exists():
+            opt_sig_temp.unlink()
+
+    def _on_close(self):
+        try:
+            self.config_dir.mkdir(parents=True, exist_ok=True)
+            import json
+            if self.wm_state() == "normal":
+                config = {"geometry": self.geometry(), "same_pos": self.same_pos_var.get()}
+                with open(self.config_file, "w") as f:
+                    json.dump(config, f)
+        except Exception:
+            pass
+        self.destroy()
+
+
+def main():
+    initial_files = sys.argv[1:] if len(sys.argv) > 1 else None
+    app = PDFSignerApp(initial_files=initial_files)
+    app.mainloop()
+
+
+if __name__ == "__main__":
+    main()

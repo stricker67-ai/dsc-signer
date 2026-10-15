@@ -1,0 +1,17 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.bak*
+.DS_Store
+
+# Never commit signed output, test documents or personal stamp/signature artwork
+*.pdf
+*.png
+*.jpg
+*.jpeg
+
+# Build output of tools/scard_trace.c
+*.dylib
+*.so
+*.log

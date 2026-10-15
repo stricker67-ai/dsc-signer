@@ -1,0 +1,72 @@
+#!/bin/zsh
+# dsc-sign-pdfexpert — sign the PDF that is open in PDF Expert (or the PDFs given as
+# arguments) with dsc-sign-gui, then open each signed copy in PDF Expert
+# (or the default PDF viewer when PDF Expert is not installed).
+# Used by the "Sign with DSC" Quick Actions in ~/Library/Services.
+set -u
+GUI="${DSC_SIGN_GUI:-${0:A:h}/dsc-sign-gui}"
+APP="PDF Expert"
+LOG="$HOME/Library/Logs/dsc-sign-pdfexpert.log"
+
+detect_only=0
+[[ "${1:-}" == "--detect" ]] && { detect_only=1; shift; }
+
+alert() {
+  if (( detect_only )); then print -u2 -- "$1"; else osascript -e "display alert \"Sign with DSC\" message \"$1\"" >/dev/null 2>&1; fi
+}
+log() { print -r -- "$(date '+%F %T') $*" >>"$LOG"; }
+files=("$@")
+
+if (( ${#files} == 0 )); then
+  pid=$(pgrep -x "$APP" | head -1)
+  if [[ -z "$pid" ]]; then alert "PDF Expert is not running."; exit 1; fi
+  # PDF Expert keeps its open documents mapped, so lsof lists them (-Fn = one "n<path>" line each).
+  open_pdfs=("${(@f)$(lsof -p "$pid" -Fn 2>/dev/null | sed -n 's/^n//p' | grep -i '\.pdf$' | sort -u)}")
+  open_pdfs=("${(@)open_pdfs:#}")
+  if (( ${#open_pdfs} == 0 )); then alert "No PDF document is open in PDF Expert."; exit 1; fi
+  # The front window's title is the file name without extension (needs Accessibility; optional).
+  title=$(osascript -e 'tell application "System Events" to tell process "PDF Expert" to get name of front window' 2>/dev/null)
+  chosen=()
+  if [[ -n "$title" ]]; then
+    for f in "${open_pdfs[@]}"; do
+      stem="${${f:t}:r}"
+      [[ "$title" == "$stem" || "$title" == "$stem "* ]] && chosen+=("$f")
+    done
+  fi
+  if (( ${#chosen} == 0 )); then
+    if (( ${#open_pdfs} == 1 )); then
+      chosen=("${open_pdfs[1]}")
+    else
+      list=$(printf '"%s",' "${open_pdfs[@]}"); list="{${list%,}}"
+      pick=$(osascript -e "choose from list $list with title \"Sign with DSC\" with prompt \"Which open PDF should be signed?\"" 2>/dev/null)
+      [[ -z "$pick" || "$pick" == "false" ]] && exit 0
+      chosen=("$pick")
+    fi
+  fi
+  files=("${chosen[@]}")
+fi
+
+if (( detect_only )); then print -l -- "${files[@]}"; exit 0; fi
+
+log "signing: ${files[*]}"
+start=$(date +%s)
+"$GUI" "${files[@]}" >>"$LOG" 2>&1 &
+gpid=$!
+
+typeset -A opened last_size
+check_outputs() {
+  local f s sz
+  for f in "${files[@]}"; do
+    s="${f:r}_signed.pdf"
+    [[ -f "$s" && -z "${opened[$s]:-}" ]] || continue
+    (( $(stat -f %m "$s") >= start )) || continue
+    sz=$(stat -f %z "$s")
+    # open only once the file has stopped changing (the GUI copies first, then writes the signature)
+    if [[ "${last_size[$s]:-}" == "$sz" ]] && (( $(date +%s) - $(stat -f %m "$s") >= 2 )); then
+      { open -a "$APP" "$s" 2>/dev/null || open "$s"; } && opened[$s]=1 && log "opened: $s"
+    fi
+    last_size[$s]=$sz
+  done
+}
+while kill -0 "$gpid" 2>/dev/null; do check_outputs; sleep 1; done
+sleep 2; check_outputs

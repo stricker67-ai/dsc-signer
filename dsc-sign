@@ -1,0 +1,476 @@
+#!/usr/bin/env python3
+"""Sign a PDF with the Hypersecu HYP2003 USB token.
+
+Optionally overlays company stamps (round seal + signatory block)
+onto the signed pages *before* signing, so the imagery is covered by the
+digital signature. With --signatory-stamp the DSC signature is placed inside
+the stamp's blank "(Signature)" gap.
+"""
+
+import os
+import sys
+import getpass
+import tempfile
+import argparse
+from pathlib import Path
+
+# Sibling module that overlays the company stamps before signing.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import dsc_stamp
+
+import dsc_pkcs11
+
+# PKCS#11 module is discovered per-platform (Linux .so / macOS .dylib) rather
+# than hardcoded. Resolution never fails at import time, so the GUI still opens
+# when the token driver is missing; the error surfaces when you actually sign.
+def _resolve_pkcs11():
+    global PKCS11_MODULE
+    if not PKCS11_MODULE:
+        PKCS11_MODULE = dsc_pkcs11.find_module()
+    return PKCS11_MODULE
+
+try:
+    PKCS11_MODULE = dsc_pkcs11.find_module()
+except RuntimeError:
+    PKCS11_MODULE = ""
+TOKEN_LABEL = "HYP2003"
+
+
+def parse_box(text):
+    """Parse 'X,Y,W,H' into a tuple of four floats (PDF points)."""
+    parts = [p.strip() for p in text.split(",")]
+    if len(parts) != 4:
+        raise argparse.ArgumentTypeError("box must be X,Y,W,H (PDF points)")
+    try:
+        return tuple(float(p) for p in parts)
+    except ValueError:
+        raise argparse.ArgumentTypeError("box values must be numbers")
+
+
+def get_optimized_signature_image(img_path):
+    """Optimizes a signature image to prevent PDF bloat.
+    Resizes large images to max 800px width/height and saves to a temp PNG.
+    Returns Path of optimized image (caller should cleanup), or original path.
+    """
+    from PIL import Image
+    
+    path_obj = Path(img_path)
+    if not path_obj.exists():
+        return path_obj
+        
+    try:
+        if path_obj.stat().st_size < 100 * 1024:
+            return path_obj
+            
+        with Image.open(path_obj) as im:
+            max_dim = 800
+            w, h = im.size
+            if w > max_dim or h > max_dim:
+                if w > h:
+                    new_w = max_dim
+                    new_h = int(h * (max_dim / w))
+                else:
+                    new_h = max_dim
+                    new_w = int(w * (max_dim / h))
+                try:
+                    resample_filter = Image.Resampling.LANCZOS
+                except AttributeError:
+                    resample_filter = Image.LANCZOS
+                im = im.resize((new_w, new_h), resample_filter)
+            
+            fd, temp_file_path = tempfile.mkstemp(suffix=".png")
+            os.close(fd)
+            temp_path = Path(temp_file_path)
+            im.save(temp_path, "PNG", optimize=True)
+            return temp_path
+    except Exception as e:
+        print(f"Warning during signature image optimization: {e}")
+        return path_obj
+
+
+def resolve_pages(spec, num_pages):
+    """Turn a --pages spec into a sorted list of 0-based page indices."""
+    spec = spec.strip().lower()
+    if spec == "last":
+        return [num_pages - 1]
+    if spec == "all":
+        return list(range(num_pages))
+    out = []
+    for tok in spec.split(","):
+        tok = tok.strip()
+        if tok.isdigit():
+            idx = int(tok) - 1
+            if 0 <= idx < num_pages:
+                out.append(idx)
+    return sorted(set(out))
+
+
+def run_gs_compress(inp, out, settings_or_resolution):
+    import subprocess
+    if isinstance(settings_or_resolution, str):
+        cmd = [
+            "gs", "-sDEVICE=pdfwrite", "-dCompatibilityLevel=1.4",
+            f"-dPDFSETTINGS={settings_or_resolution}", "-dNOPAUSE", "-dQUIET",
+            "-dBATCH", f"-sOutputFile={out}", str(inp)
+        ]
+    else:
+        res = settings_or_resolution
+        cmd = [
+            "gs", "-sDEVICE=pdfwrite", "-dCompatibilityLevel=1.4",
+            "-dNOPAUSE", "-dQUIET", "-dBATCH",
+            "-dColorImageDownsampleType=/Bicubic", f"-dColorImageResolution={res}",
+            "-dGrayImageDownsampleType=/Bicubic", f"-dGrayImageResolution={res}",
+            "-dMonoImageDownsampleType=/Bicubic", f"-dMonoImageResolution={res}",
+            f"-sOutputFile={out}", str(inp)
+        ]
+    res = subprocess.run(cmd, capture_output=True, text=True)
+    return res.returncode == 0
+
+
+def compress_to_target_size(inp, out, target_kb):
+    import tempfile
+    import shutil
+    from pathlib import Path
+    
+    attempts = ["/printer", "/ebook", "/screen", 50, 30]
+    best_temp = None
+    best_size = None
+    
+    for setting in attempts:
+        fd, temp_path = tempfile.mkstemp(suffix=".pdf")
+        os.close(fd)
+        t_path = Path(temp_path)
+        
+        try:
+            success = run_gs_compress(inp, t_path, setting)
+            if success and t_path.exists():
+                size_kb = t_path.stat().st_size / 1024.0
+                if size_kb <= target_kb:
+                    shutil.copy(str(t_path), str(out))
+                    t_path.unlink()
+                    if best_temp and best_temp.exists():
+                        best_temp.unlink()
+                    return True
+                
+                if best_size is None or size_kb < best_size:
+                    if best_temp and best_temp.exists():
+                        best_temp.unlink()
+                    best_temp = t_path
+                    best_size = size_kb
+                else:
+                    t_path.unlink()
+        except Exception:
+            if t_path.exists():
+                t_path.unlink()
+                
+    if best_temp and best_temp.exists():
+        shutil.copy(str(best_temp), str(out))
+        best_temp.unlink()
+        return True
+    return False
+
+
+def preprocess_pdf(current_input, do_ocr, do_compress, compress_mode, target_size_kb, temp_files):
+    import subprocess
+    import tempfile
+    from pathlib import Path
+    
+    if do_ocr:
+        fd, temp_file_path = tempfile.mkstemp(suffix=".pdf")
+        os.close(fd)
+        temp_file_ocr = Path(temp_file_path)
+        temp_files.append(temp_file_ocr)
+        
+        cmd = ["ocrmypdf", "--force-ocr", str(current_input), str(temp_file_ocr)]
+        res = subprocess.run(cmd, capture_output=True, text=True)
+        if res.returncode != 0:
+            raise RuntimeError(f"OCR failed: {res.stderr}")
+        current_input = temp_file_ocr
+
+    if do_compress:
+        fd, temp_file_path = tempfile.mkstemp(suffix=".pdf")
+        os.close(fd)
+        temp_file_compress = Path(temp_file_path)
+        temp_files.append(temp_file_compress)
+        
+        if target_size_kb is not None:
+            success = compress_to_target_size(current_input, temp_file_compress, target_size_kb)
+            if not success:
+                raise RuntimeError("Target size compression failed")
+        else:
+            gs_mode = "/ebook"
+            if compress_mode == "low":
+                gs_mode = "/printer"
+            elif compress_mode == "high":
+                gs_mode = "/screen"
+            
+            success = run_gs_compress(current_input, temp_file_compress, gs_mode)
+            if not success:
+                raise RuntimeError("Compression failed")
+        
+        current_input = temp_file_compress
+        
+    return current_input
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Sign a PDF with the Hypersecu HYP2003 USB token.")
+    parser.add_argument("input", help="Input PDF file")
+    parser.add_argument("output", nargs="?", help="Output PDF file (optional)")
+    parser.add_argument("--stamp-mode", choices=["text", "image"],
+                        default="text", help="DSC signature appearance mode")
+    parser.add_argument("--pages", default="last",
+                        help="Pages to sign/stamp: last | all | 1,3,5")
+    parser.add_argument("--round-stamp", action="store_true",
+                        help="Overlay the round company seal")
+    parser.add_argument("--signatory-stamp", action="store_true",
+                        help="Overlay the signatory block; the DSC signature "
+                             "fills its '(Signature)' gap")
+    parser.add_argument("--round-stamp-img", default=dsc_stamp.ROUND_STAMP,
+                        help="Round seal image (PNG)")
+    parser.add_argument("--signatory-stamp-img", default=dsc_stamp.SIGNATORY_STAMP,
+                        help="Signatory block image (PNG)")
+    parser.add_argument("--round-stamp-box", type=parse_box, default=None,
+                        help="Round seal box X,Y,W,H, PDF points, top-left "
+                             "origin (default: bottom-right corner)")
+    parser.add_argument("--signatory-stamp-box", type=parse_box, default=None,
+                        help="Signatory block box X,Y,W,H, PDF points, "
+                             "top-left origin (default: bottom-left)")
+    parser.add_argument("--compress", action="store_true",
+                        help="Compress PDF using Ghostscript")
+    parser.add_argument("--compress-mode", choices=["low", "medium", "high"], default="medium",
+                        help="Compression quality (default: medium)")
+    parser.add_argument("--target-size-kb", type=int, default=None,
+                        help="Try to compress PDF to be under this size in KB")
+    parser.add_argument("--ocr", action="store_true",
+                        help="Run OCR on PDF using OCRmyPDF")
+    parser.add_argument("--no-sign", action="store_true",
+                        help="Perform actions only, without digital signing")
+    args = parser.parse_args()
+
+    input_path = Path(args.input).resolve()
+    if not input_path.exists():
+        sys.exit(f"Error: {input_path} not found")
+    if input_path.suffix.lower() != ".pdf":
+        sys.exit("Error: Only PDF files are supported")
+
+    default_suffix = "_processed" if args.no_sign else "_signed"
+    output_path = (Path(args.output).resolve() if args.output
+                   else input_path.with_stem(input_path.stem + default_suffix))
+
+    try:
+        from pyhanko.sign.pkcs11 import (PKCS11Signer, open_pkcs11_session,
+                                         TokenCriteria)
+        from pyhanko.sign import signers
+        from pyhanko.sign.fields import SigFieldSpec
+        from pyhanko.sign.signers.pdf_signer import PdfSigner
+        from pyhanko.stamp.static import StaticStampStyle
+        from pyhanko.stamp.text import TextStampStyle
+        from pyhanko.stamp import STAMP_ART_CONTENT
+        from pyhanko.pdf_utils.images import PdfImage
+        from pyhanko.pdf_utils.incremental_writer import IncrementalPdfFileWriter
+        import pkcs11 as pk
+        from pypdf import PdfReader
+    except ImportError as e:
+        sys.exit(f"Error: missing dependency ({e}). "
+                 f"Run: pip install 'pyhanko[pkcs11]' pypdf pymupdf")
+
+    try:
+        _resolve_pkcs11()
+    except RuntimeError as exc:
+        sys.exit(f"Error: {exc}")
+
+    # Page geometry
+    reader = PdfReader(str(input_path))
+    num_pages = len(reader.pages)
+    page_sizes = [(float(p.mediabox.width), float(p.mediabox.height))
+                  for p in reader.pages]
+    pages = resolve_pages(args.pages, num_pages)
+    if not pages:
+        sys.exit(f"Error: no valid pages selected from '{args.pages}'")
+
+    def signatory_box(page_h):
+        """Signatory-stamp placement for a page (top-left origin), undistorted."""
+        bx, by, bw, _ = args.signatory_stamp_box or (
+            50.0, page_h - 190.0, 320.0, 0.0)
+        return (bx, by, bw, bw / dsc_stamp.SIGNATORY_ASPECT)
+
+    temp_files = []
+    stamp_temp = None
+
+    if args.no_sign:
+        if not (args.compress or args.ocr or args.round_stamp or args.signatory_stamp):
+            sys.exit("Error: No action specified. Use --compress, --ocr, --round-stamp, or --signatory-stamp.")
+
+        current_input = input_path
+
+        # ── Pre-Processing (Compress / OCR) ───────────────────────────
+        if args.compress or args.ocr:
+            try:
+                current_input = preprocess_pdf(current_input, args.ocr, args.compress, args.compress_mode, args.target_size_kb, temp_files)
+            except Exception as e:
+                for f in temp_files:
+                    if f.exists(): f.unlink()
+                sys.exit(f"Error: {e}")
+
+        # ── Overlay company stamps ─────────────────────────────────────
+        if args.round_stamp or args.signatory_stamp:
+            placements = {}
+            for pg in pages:
+                pw, ph = page_sizes[pg]
+                items = []
+                if args.signatory_stamp:
+                    items.append((args.signatory_stamp_img, *signatory_box(ph)))
+                if args.round_stamp:
+                    box = args.round_stamp_box or (
+                        pw - 170.0, ph - 190.0, 130.0, 130.0)
+                    items.append((args.round_stamp_img, *box))
+                placements[pg] = items
+            fd, stamp_temp_path = tempfile.mkstemp(suffix=".pdf")
+            os.close(fd)
+            stamp_temp = Path(stamp_temp_path)
+            n = dsc_stamp.apply_stamps(str(current_input), str(stamp_temp), placements)
+            current_input = stamp_temp
+            print(f"Applied {n} stamp(s) across {len(pages)} page(s)")
+
+        import shutil
+        shutil.copy(str(current_input), str(output_path))
+        
+        for f in temp_files:
+            if f.exists(): f.unlink()
+        if stamp_temp and stamp_temp.exists():
+            stamp_temp.unlink()
+        print(f"Processed file saved to: {output_path}")
+        sys.exit(0)
+
+    pin = getpass.getpass("Token PIN: ")
+    print("Opening token session...")
+    try:
+        session = open_pkcs11_session(
+            lib_location=PKCS11_MODULE,
+            token_criteria=TokenCriteria(label=TOKEN_LABEL),
+            user_pin=pin,
+        )
+    except Exception as e:
+        sys.exit(f"Error opening token: {e!r}")
+
+    stamp_temp = None
+    try:
+        cert_label = None
+        for obj in session.get_objects(
+                {pk.Attribute.CLASS: pk.ObjectClass.CERTIFICATE}):
+            cert_label = obj[pk.Attribute.LABEL]
+            break
+        if not cert_label:
+            sys.exit("Error: No certificates found on token")
+        print(f"Using certificate: {cert_label}")
+        signer = PKCS11Signer(pkcs11_session=session,
+                              key_label=cert_label, cert_label=cert_label,
+                              use_raw_mechanism=True)
+
+        current_input = input_path
+
+        # ── Pre-Processing (Compress / OCR) ───────────────────────────
+        if args.compress or args.ocr:
+            try:
+                current_input = preprocess_pdf(current_input, args.ocr, args.compress, args.compress_mode, args.target_size_kb, temp_files)
+            except Exception as e:
+                for f in temp_files:
+                    if f.exists(): f.unlink()
+                sys.exit(f"Error: {e}")
+
+        # ── Overlay company stamps before signing ──────────────────────
+        if args.round_stamp or args.signatory_stamp:
+            placements = {}
+            for pg in pages:
+                pw, ph = page_sizes[pg]
+                items = []
+                if args.signatory_stamp:
+                    items.append((args.signatory_stamp_img, *signatory_box(ph)))
+                if args.round_stamp:
+                    box = args.round_stamp_box or (
+                        pw - 170.0, ph - 190.0, 130.0, 130.0)
+                    items.append((args.round_stamp_img, *box))
+                placements[pg] = items
+            fd, stamp_temp_path = tempfile.mkstemp(suffix=".pdf")
+            os.close(fd)
+            stamp_temp = Path(stamp_temp_path)
+            n = dsc_stamp.apply_stamps(str(current_input), str(stamp_temp),
+                                       placements)
+            current_input = stamp_temp
+            print(f"Applied {n} stamp(s) across {len(pages)} page(s)")
+
+        # ── DSC signature appearance ───────────────────────────────────
+        opt_sig_temp = None
+        if args.stamp_mode == "text":
+            try:
+                signer_name = signer.subject_name or "Unknown Signer"
+            except Exception:
+                signer_name = "Unknown Signer"
+            stamp_style = TextStampStyle(
+                stamp_text="Digitally signed by %(signer)s.\nTimestamp: %(ts)s.",
+                background=STAMP_ART_CONTENT)
+            appearance_params = {"signer": signer_name}
+        else:
+            stamp_style = None
+            appearance_params = None
+            img = dsc_stamp.SIGNATURE_IMAGE
+            if os.path.exists(img):
+                try:
+                    opt_sig_temp = get_optimized_signature_image(img)
+                    stamp_style = StaticStampStyle(background=PdfImage(str(opt_sig_temp)))
+                except Exception as e:
+                    print(f"Warning: could not load appearance image: {e}")
+
+        # ── Sign each selected page ────────────────────────────────────
+        print(f"Signing {input_path.name}: pages {[p + 1 for p in pages]}...")
+        for pg in pages:
+            pw, ph = page_sizes[pg]
+            if args.signatory_stamp:
+                # DSC field lands inside the stamp's "(Signature)" gap.
+                sx, sy, sw, sh = dsc_stamp.gap_rect(signatory_box(ph))
+            else:
+                sx, sy, sw, sh = 50.0, ph - 130.0, 300.0, 80.0  # bottom-left
+
+            # Convert top-left origin -> PDF bottom-left origin.
+            x1 = max(0.0, sx)
+            y1 = max(0.0, ph - sy - sh)
+            box_pts = (x1, y1, x1 + sw, y1 + sh)
+
+            field_name = f"DSC_Signature_{pg + 1}"
+            with open(current_input, "rb") as inf:
+                writer = IncrementalPdfFileWriter(inf, strict=False)
+                pdf_signer = PdfSigner(
+                    signers.PdfSignatureMetadata(field_name=field_name),
+                    signer,
+                    new_field_spec=SigFieldSpec(sig_field_name=field_name,
+                                                on_page=pg, box=box_pts),
+                    stamp_style=stamp_style)
+                if appearance_params:
+                    out = pdf_signer.sign_pdf(
+                        writer, appearance_text_params=appearance_params)
+                else:
+                    out = pdf_signer.sign_pdf(writer)
+            with open(output_path, "wb") as outf:
+                outf.write(out.getvalue())
+            current_input = output_path  # chain so each page adds a signature
+            print(f"  signed page {pg + 1}")
+
+        print(f"Signed: {output_path}")
+    finally:
+        try:
+            session.close()
+        except Exception:
+            pass
+        if stamp_temp and stamp_temp.exists():
+            stamp_temp.unlink()
+        if opt_sig_temp and opt_sig_temp != Path(img) and opt_sig_temp.exists():
+            opt_sig_temp.unlink()
+        for f in temp_files:
+            if f.exists():
+                f.unlink()
+
+
+if __name__ == "__main__":
+    main()
