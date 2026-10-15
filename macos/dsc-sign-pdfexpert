@@ -59,10 +59,10 @@ check_outputs() {
   for f in "${files[@]}"; do
     s="${f:r}_signed.pdf"
     [[ -f "$s" && -z "${opened[$s]:-}" ]] || continue
-    (( $(stat -f %m "$s") >= start )) || continue
-    sz=$(stat -f %z "$s")
+    (( $(/usr/bin/stat -f %m "$s") >= start )) || continue
+    sz=$(/usr/bin/stat -f %z "$s")
     # open only once the file has stopped changing (the GUI copies first, then writes the signature)
-    if [[ "${last_size[$s]:-}" == "$sz" ]] && (( $(date +%s) - $(stat -f %m "$s") >= 2 )); then
+    if [[ "${last_size[$s]:-}" == "$sz" ]] && (( $(date +%s) - $(/usr/bin/stat -f %m "$s") >= 2 )); then
       { open -a "$APP" "$s" 2>/dev/null || open "$s"; } && opened[$s]=1 && log "opened: $s"
     fi
     last_size[$s]=$sz
