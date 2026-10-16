@@ -2,13 +2,26 @@
 # install.sh — install dsc-signer for the current user.
 #
 #   ./install.sh            venv in ~/.local/share/dsc-sign/venv, scripts in ~/.local/bin
+#   ./install.sh --drivers  macOS: also fetch the token drivers from Hypersecu's
+#                           official package, verify them and set them up
+#                           (runs macos/fetch-drivers.sh --install-reader; asks
+#                           for your password and to unplug/replug the token)
 #   PREFIX=/opt/x ./install.sh
 #   PYTHON=python3.13 ./install.sh
 #
 # On macOS it also installs the "Sign with DSC" Quick Actions (Finder, and
 # PDF Expert if present); skip them with DSC_QUICK_ACTIONS=0.
-# Token drivers are NOT installed - see README.
+# Without --drivers no token driver is installed - see README.
 set -eu
+
+DRIVERS=0
+for arg in "$@"; do
+  case $arg in
+    --drivers) DRIVERS=1 ;;
+    -h|--help) sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) echo "unknown option: $arg"; exit 2 ;;
+  esac
+done
 
 HERE=$(cd "$(dirname "$0")" && pwd)
 PREFIX=${PREFIX:-$HOME/.local}
@@ -48,5 +61,17 @@ for tool in pdftoppm gs ocrmypdf; do
 done
 
 echo
-echo "Installed to $PREFIX/bin. Check the token driver with:"
+echo "Installed to $PREFIX/bin."
+
+if [ "$DRIVERS" = 1 ]; then
+  if [ "$(uname -s)" = Darwin ]; then
+    "$HERE/macos/fetch-drivers.sh" --install-reader
+  else
+    echo "--drivers is macOS-only; on Linux install Hypersecu's Linux middleware (see README)."
+  fi
+elif [ "$(uname -s)" = Darwin ]; then
+  echo "Token drivers: run ./install.sh --drivers, or see README 'macOS setup'."
+fi
+
+echo "Check the token driver with:"
 echo "  $VENV/bin/python $PREFIX/bin/dsc_pkcs11.py"

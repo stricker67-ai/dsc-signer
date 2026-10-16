@@ -47,7 +47,28 @@ Install Hypersecu's Linux middleware for the HYP2003. It provides `/usr/lib/libc
 
 ### macOS setup (Apple Silicon)
 
-The macOS setup needs three things, all from Hypersecu's official macOS package.
+The macOS setup needs three things, all from Hypersecu's official macOS package. Because the drivers are Feitian's proprietary (or unpublished-source) code, they are not included in this repo. Either let the optional helper fetch them, or follow the manual steps.
+
+**Quick route (optional).** The helper sets everything up from the official package:
+
+```sh
+./install.sh --drivers          # or, any time later:  macos/fetch-drivers.sh --install-reader
+```
+
+`macos/fetch-drivers.sh` does the following:
+- Downloads `HYP2003-MAC-iOS.zip` from hypersecu.com and checks its SHA-256 against the tested February 2025 build.
+- Checks that the installer is signed by Feitian (team `S47T4UESP3`) and notarized by Apple, and that both extracted files carry valid Feitian signatures.
+- Copies out only the PKCS#11 module and the reader driver. The vendor's installer, scripts, launch agent and apps are never run.
+- Performs steps 2 and 3 below. It asks for your password and tells you when to unplug and replug the token.
+
+More options:
+- Without `--install-reader`, it only installs the per-user PKCS#11 module and prints the `sudo` steps.
+- `--zip FILE` uses an archive you already downloaded.
+- `--dry-run` prints the `sudo` commands instead of running them.
+- `--uninstall-reader` reverts the reader-driver part.
+- If Hypersecu publishes a new build, the hash check stops the script and nothing is installed.
+
+The manual steps follow.
 
 **1. Get the package.** Hypersecu's download page only shows Windows. The macOS build is `HYP2003-MAC-iOS.zip` on their file archive:
 `https://www.hypersecu.com/_files/archives/5aae8d_455153f9dcfa4f98a57824244cc520a3.zip?dn=HYP2003-MAC-iOS.zip`
